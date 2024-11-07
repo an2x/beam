@@ -81,7 +81,6 @@ dependencies {
   shadow library.java.vendored_grpc_1_60_1
   shadow library.java.vendored_guava_32_1_2_jre
   shadow library.java.byte_buddy
-  shadow library.java.antlr_runtime
   shadow library.java.commons_compress
   shadow library.java.commons_lang3
   testImplementation library.java.mockito_inline
@@ -98,7 +97,7 @@ dependencies {
   permitUnusedDeclared enforcedPlatform(library.java.google_cloud_platform_libraries_bom)
   provided library.java.json_org
   implementation library.java.everit_json_schema
-  implementation "org.yaml:snakeyaml:2.0"
+  implementation library.java.snake_yaml
   shadowTest library.java.everit_json_schema
   provided library.java.junit
   testImplementation "com.github.stefanbirkner:system-rules:1.19.0"

@@ -24,14 +24,16 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"html/template"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/metrics"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/runtime/metricsx"
@@ -39,7 +41,6 @@ import (
 	jobpb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/jobmanagement_v1"
 	pipepb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/pipeline_v1"
 	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slog"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 )
@@ -373,8 +374,12 @@ type jobCancelHandler struct {
 	Jobcli jobpb.JobServiceClient
 }
 
+type cancelJobRequest struct {
+	JobID string `json:"job_id"`
+}
+
 func (h *jobCancelHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var cancelRequest *jobpb.CancelJobRequest
+	var cancelRequest *cancelJobRequest
 	if r.Method != http.MethodPost {
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
@@ -395,7 +400,10 @@ func (h *jobCancelHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := h.Jobcli.Cancel(r.Context(), cancelRequest)
+	// Forward JobId from POST body avoids direct json Unmarshall on composite types containing protobuf message types.
+	resp, err := h.Jobcli.Cancel(r.Context(), &jobpb.CancelJobRequest{
+		JobId: cancelRequest.JobID,
+	})
 	if err != nil {
 		statusCode := status.Code(err)
 		httpCode := http.StatusInternalServerError
@@ -428,5 +436,6 @@ func Initialize(ctx context.Context, port int, jobcli jobpb.JobServiceClient) er
 	endpoint := fmt.Sprintf("localhost:%d", port)
 
 	slog.Info("Serving WebUI", slog.String("endpoint", "http://"+endpoint))
-	return http.ListenAndServe(endpoint, mux)
+	go http.ListenAndServe(endpoint, mux)
+	return nil
 }

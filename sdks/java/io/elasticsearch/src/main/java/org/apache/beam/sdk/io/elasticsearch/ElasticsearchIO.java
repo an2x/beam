@@ -110,6 +110,7 @@ import org.apache.http.ssl.SSLContexts;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.elasticsearch.client.Request;
 import org.elasticsearch.client.Response;
+import org.elasticsearch.client.ResponseException;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestClientBuilder;
 import org.joda.time.Duration;
@@ -345,6 +346,8 @@ public class ElasticsearchIO {
 
     public abstract boolean isTrustSelfSignedCerts();
 
+    public abstract boolean isCompressionEnabled();
+
     abstract Builder builder();
 
     @AutoValue.Builder
@@ -377,6 +380,8 @@ public class ElasticsearchIO {
 
       abstract Builder setTrustSelfSignedCerts(boolean trustSelfSignedCerts);
 
+      abstract Builder setCompressionEnabled(boolean compressionEnabled);
+
       abstract ConnectionConfiguration build();
     }
 
@@ -398,6 +403,7 @@ public class ElasticsearchIO {
           .setIndex(index)
           .setType(type)
           .setTrustSelfSignedCerts(false)
+          .setCompressionEnabled(true)
           .build();
     }
 
@@ -417,6 +423,7 @@ public class ElasticsearchIO {
           .setIndex(index)
           .setType("")
           .setTrustSelfSignedCerts(false)
+          .setCompressionEnabled(true)
           .build();
     }
 
@@ -434,6 +441,7 @@ public class ElasticsearchIO {
           .setIndex("")
           .setType("")
           .setTrustSelfSignedCerts(false)
+          .setCompressionEnabled(true)
           .build();
     }
 
@@ -634,6 +642,19 @@ public class ElasticsearchIO {
     }
 
     /**
+     * Configure whether the REST client should compress requests using gzip content encoding and
+     * add the "Accept-Encoding: gzip". The default is true.
+     *
+     * @param compressionEnabled Whether to compress requests using gzip content encoding and add
+     *     the "Accept-Encoding: gzip"
+     * @return a {@link ConnectionConfiguration} describes a connection configuration to
+     *     Elasticsearch.
+     */
+    public ConnectionConfiguration withCompressionEnabled(boolean compressionEnabled) {
+      return builder().setCompressionEnabled(compressionEnabled).build();
+    }
+
+    /**
      * If set, overwrites the default max retry timeout (30000ms) in the Elastic {@link RestClient}
      * and the default socket timeout (30000ms) in the {@link RequestConfig} of the Elastic {@link
      * RestClient}.
@@ -669,6 +690,7 @@ public class ElasticsearchIO {
       builder.addIfNotNull(DisplayData.item("socketTimeout", getSocketTimeout()));
       builder.addIfNotNull(DisplayData.item("connectTimeout", getConnectTimeout()));
       builder.addIfNotNull(DisplayData.item("trustSelfSignedCerts", isTrustSelfSignedCerts()));
+      builder.addIfNotNull(DisplayData.item("compressionEnabled", isCompressionEnabled()));
     }
 
     private SSLContext getSSLContext() throws IOException {
@@ -715,6 +737,9 @@ public class ElasticsearchIO {
       if (getDefaultHeaders() != null) {
         Header[] headerList = new Header[getDefaultHeaders().size()];
         restClientBuilder.setDefaultHeaders(getDefaultHeaders().toArray(headerList));
+      }
+      if (isCompressionEnabled()) {
+        restClientBuilder.setCompressionEnabled(true);
       }
 
       restClientBuilder.setHttpClientConfigCallback(
@@ -2560,11 +2585,12 @@ public class ElasticsearchIO {
     /**
      * Whether to throw runtime exceptions when write (IO) errors occur. Especially useful in
      * streaming pipelines where non-transient IO failures will cause infinite retries. If true, a
-     * runtime error will be thrown for any error found by {@link
-     * ElasticsearchIO#createWriteReport}. If false, a {@link PCollectionTuple} will be returned
-     * with tags {@link Write#SUCCESSFUL_WRITES} and {@link Write#FAILED_WRITES}, each being a
-     * {@link PCollection} of {@link Document} representing documents which were written to
-     * Elasticsearch without errors and those which failed to write due to errors, respectively.
+     * runtime error will be thrown for any error found by {@link ElasticsearchIO#createWriteReport}
+     * and/or java.io.IOException (which is what org.elasticsearch.client.ResponseException based
+     * on) found by in batch flush. If false, a {@link PCollectionTuple} will be returned with tags
+     * {@link Write#SUCCESSFUL_WRITES} and {@link Write#FAILED_WRITES}, each being a {@link
+     * PCollection} of {@link Document} representing documents which were written to Elasticsearch
+     * without errors and those which failed to write due to errors, respectively.
      *
      * @param throwWriteErrors whether to surface write errors as runtime exceptions or return them
      *     in a {@link PCollection}
@@ -2788,6 +2814,13 @@ public class ElasticsearchIO {
         // RestClient#performRequest only throws wrapped IOException so we must inspect the
         // exception cause to determine if the exception is likely transient i.e. retryable or
         // not.
+
+        // Retry for 500-range response code except for 501.
+        if (t.getCause() instanceof ResponseException) {
+          ResponseException ex = (ResponseException) t.getCause();
+          int statusCode = ex.getResponse().getStatusLine().getStatusCode();
+          return statusCode >= 500 && statusCode != 501;
+        }
         return t.getCause() instanceof ConnectTimeoutException
             || t.getCause() instanceof SocketTimeoutException
             || t.getCause() instanceof ConnectionClosedException
@@ -2830,6 +2863,9 @@ public class ElasticsearchIO {
 
         HttpEntity requestBody =
             new NStringEntity(bulkRequest.toString(), ContentType.APPLICATION_JSON);
+
+        String elasticResponseExceptionMessage = null;
+
         try {
           Request request = new Request("POST", endPoint);
           request.addParameters(Collections.emptyMap());
@@ -2838,12 +2874,18 @@ public class ElasticsearchIO {
           responseEntity = new BufferedHttpEntity(response.getEntity());
         } catch (java.io.IOException ex) {
           if (spec.getRetryConfiguration() == null || !isRetryableClientException(ex)) {
-            throw ex;
+            if (spec.getThrowWriteErrors()) {
+              throw ex;
+            } else {
+              elasticResponseExceptionMessage = ex.getMessage();
+            }
+          } else {
+            LOG.error("Caught ES timeout, retrying", ex);
           }
-          LOG.error("Caught ES timeout, retrying", ex);
         }
 
         if (spec.getRetryConfiguration() != null
+            && elasticResponseExceptionMessage == null
             && (response == null
                 || responseEntity == null
                 || spec.getRetryConfiguration().getRetryPredicate().test(responseEntity))) {
@@ -2854,9 +2896,25 @@ public class ElasticsearchIO {
           responseEntity = handleRetry("POST", endPoint, Collections.emptyMap(), requestBody);
         }
 
-        List<Document> responses =
-            createWriteReport(
-                responseEntity, spec.getAllowedResponseErrors(), spec.getThrowWriteErrors());
+        List<Document> responses;
+        // If java.io.IOException was thrown, return all input Documents with
+        // withHasError(true)
+        // so that they could be caught by FAILED_WRITES tag.
+        if (elasticResponseExceptionMessage != null) {
+          String errorJsonMessage =
+              String.format(
+                  "{\"message\":\"java.io.IOException was thrown in batch flush: %s\"}",
+                  elasticResponseExceptionMessage);
+
+          responses =
+              inputEntries.stream()
+                  .map(doc -> doc.withHasError(true).withResponseItemJson(errorJsonMessage))
+                  .collect(Collectors.toList());
+        } else {
+          responses =
+              createWriteReport(
+                  responseEntity, spec.getAllowedResponseErrors(), spec.getThrowWriteErrors());
+        }
 
         return Streams.zip(
                 inputEntries.stream(),

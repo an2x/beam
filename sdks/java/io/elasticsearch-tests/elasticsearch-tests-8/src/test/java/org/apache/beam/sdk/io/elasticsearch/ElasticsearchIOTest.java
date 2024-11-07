@@ -56,7 +56,7 @@ public class ElasticsearchIOTest implements Serializable {
 
     // Start the container. This step might take some time...
     container.start();
-    client = ElasticsearchIOTestUtils.clientFromContainer(container);
+    client = ElasticsearchIOTestUtils.clientFromContainer(container, true);
     setDefaultTemplate(client);
   }
 
@@ -309,5 +309,11 @@ public class ElasticsearchIOTest implements Serializable {
   public void testWriteWindowPreservation() throws Exception {
     elasticsearchIOTestCommon.setPipeline(pipeline);
     elasticsearchIOTestCommon.testWriteWindowPreservation();
+  }
+
+  @Test
+  public void testWriteWithClientResponseException() throws Exception {
+    elasticsearchIOTestCommon.setPipeline(pipeline);
+    elasticsearchIOTestCommon.testWriteWithElasticClientResponseException();
   }
 }

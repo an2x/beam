@@ -83,6 +83,8 @@ public final class BigQueryIOST extends IOStressTestBase {
 
   private static final String READ_ELEMENT_METRIC_NAME = "read_count";
   private static final String STORAGE_WRITE_API_METHOD = "STORAGE_WRITE_API";
+  private static final String STORAGE_API_AT_LEAST_ONCE_METHOD = "STORAGE_API_AT_LEAST_ONCE";
+  private static final double STORAGE_API_AT_LEAST_ONCE_MAX_ALLOWED_DIFFERENCE_FRACTION = 0.00001;
 
   private static BigQueryResourceManager resourceManager;
   private static String tableName;
@@ -170,7 +172,7 @@ public final class BigQueryIOST extends IOStressTestBase {
                   Configuration.class),
               "large",
               Configuration.fromJsonString(
-                  "{\"numColumns\":10,\"rowsPerSecond\":50000,\"minutes\":60,\"numRecords\":5000000,\"valueSizeBytes\":1000,\"pipelineTimeout\":120,\"runner\":\"DataflowRunner\"}",
+                  "{\"numColumns\":10,\"rowsPerSecond\":50000,\"minutes\":60,\"numRecords\":10000000,\"valueSizeBytes\":1000,\"pipelineTimeout\":120,\"runner\":\"DataflowRunner\"}",
                   Configuration.class));
     } catch (IOException e) {
       throw new RuntimeException(e);
@@ -188,6 +190,20 @@ public final class BigQueryIOST extends IOStressTestBase {
   public void testJsonStorageAPIWrite() throws IOException {
     configuration.writeFormat = WriteFormat.JSON.name();
     configuration.writeMethod = STORAGE_WRITE_API_METHOD;
+    runTest();
+  }
+
+  @Test
+  public void testAvroStorageAPIAtLeastOnce() throws IOException {
+    configuration.writeFormat = WriteFormat.AVRO.name();
+    configuration.writeMethod = STORAGE_API_AT_LEAST_ONCE_METHOD;
+    runTest();
+  }
+
+  @Test
+  public void testJsonStorageAPIAtLeastOnce() throws IOException {
+    configuration.writeFormat = WriteFormat.JSON.name();
+    configuration.writeMethod = STORAGE_API_AT_LEAST_ONCE_METHOD;
     runTest();
   }
 
@@ -219,16 +235,23 @@ public final class BigQueryIOST extends IOStressTestBase {
         writeIO =
             BigQueryIO.<byte[]>write()
                 .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_APPEND)
+                .withSuccessfulInsertsPropagation(false)
+                .withoutValidation()
+                .optimizedWrites()
                 .withAvroFormatFunction(
                     new AvroFormatFn(
                         configuration.numColumns,
-                        !(STORAGE_WRITE_API_METHOD.equalsIgnoreCase(configuration.writeMethod))));
+                        !(STORAGE_WRITE_API_METHOD.equalsIgnoreCase(configuration.writeMethod)
+                            || STORAGE_API_AT_LEAST_ONCE_METHOD.equalsIgnoreCase(
+                                configuration.writeMethod))));
         break;
       case JSON:
         writeIO =
             BigQueryIO.<byte[]>write()
                 .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_APPEND)
                 .withSuccessfulInsertsPropagation(false)
+                .withoutValidation()
+                .optimizedWrites()
                 .withFormatFunction(new JsonFormatFn(configuration.numColumns));
         break;
     }
@@ -274,6 +297,11 @@ public final class BigQueryIOST extends IOStressTestBase {
                 .withSchema(schema)
                 .withCustomGcsTempLocation(ValueProvider.StaticValueProvider.of(tempLocation)));
 
+    String experiments =
+        configuration.writeMethod.equals(STORAGE_API_AT_LEAST_ONCE_METHOD)
+            ? GcpOptions.STREAMING_ENGINE_EXPERIMENT + ",streaming_mode_at_least_once"
+            : GcpOptions.STREAMING_ENGINE_EXPERIMENT;
+
     PipelineLauncher.LaunchConfig options =
         PipelineLauncher.LaunchConfig.builder("write-bigquery")
             .setSdk(PipelineLauncher.Sdk.JAVA)
@@ -285,7 +313,7 @@ public final class BigQueryIOST extends IOStressTestBase {
                     .toString())
             .addParameter("numWorkers", String.valueOf(configuration.numWorkers))
             .addParameter("maxNumWorkers", String.valueOf(configuration.maxNumWorkers))
-            .addParameter("experiments", GcpOptions.STREAMING_ENGINE_EXPERIMENT)
+            .addParameter("experiments", experiments)
             .build();
 
     PipelineLauncher.LaunchInfo launchInfo = pipelineLauncher.launch(project, region, options);
@@ -305,9 +333,23 @@ public final class BigQueryIOST extends IOStressTestBase {
             getBeamMetricsName(PipelineMetricsType.COUNTER, READ_ELEMENT_METRIC_NAME));
     Long rowCount = resourceManager.getRowCount(tableName);
 
-    // Assert that numRecords equals or greater than rowCount since there might be
-    // duplicates when testing big amount of data
-    assertTrue(numRecords >= rowCount);
+    // Depending on writing method there might be duplicates on different sides (read or write).
+    if (configuration.writeMethod.equals(STORAGE_API_AT_LEAST_ONCE_METHOD)) {
+      long allowedDifference =
+          (long) (numRecords * STORAGE_API_AT_LEAST_ONCE_MAX_ALLOWED_DIFFERENCE_FRACTION);
+      long actualDifference = (long) numRecords - rowCount;
+      assertTrue(
+          String.format(
+              "Row difference (%d) exceeds the limit of %d. Rows: %d, Expected: %d",
+              actualDifference, allowedDifference, rowCount, (long) numRecords),
+          actualDifference <= allowedDifference);
+    } else {
+      assertTrue(
+          String.format(
+              "Number of rows in the table (%d) is greater than the expected number (%d).",
+              rowCount, (long) numRecords),
+          numRecords >= rowCount);
+    }
 
     // export metrics
     MetricsConfiguration metricsConfig =
