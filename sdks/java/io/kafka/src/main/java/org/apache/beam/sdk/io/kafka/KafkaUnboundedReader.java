@@ -20,7 +20,9 @@ package org.apache.beam.sdk.io.kafka;
 import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
@@ -564,6 +566,9 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
     recordsDequeuePollTimeout = Duration.millis(10);
   }
 
+  private static final String EXCEPTION_MESSAGE = "FORCE_EXCEPTION";
+  private static final byte[] EXCEPTION_MESSAGE_BYTES = EXCEPTION_MESSAGE.getBytes(StandardCharsets.UTF_8);
+
   private void consumerPollLoop() {
     // Read in a loop and enqueue the batch of records, if any, to availableRecordsQueue.
     Consumer<byte[], byte[]> consumer = Preconditions.checkStateNotNull(this.consumer);
@@ -588,6 +593,14 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
             records = ConsumerRecords.empty();
           }
 
+          if (records != null) {
+            for (ConsumerRecord<byte[], byte[]> r : records) {
+              if (Arrays.equals(r.value(), EXCEPTION_MESSAGE_BYTES)) {
+                throw new RuntimeException("Received message: " + EXCEPTION_MESSAGE);
+              }
+            }
+          }
+
           commitCheckpointMark();
         } catch (InterruptedException e) {
           LOG.warn("{}: consumer thread is interrupted", this, e); // not expected
@@ -598,7 +611,7 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
       }
       LOG.info("{}: Returning from consumer pool loop", this);
     } catch (Exception e) { // mostly an unrecoverable KafkaException.
-      LOG.error("{}: Exception while reading from Kafka", this, e);
+      LOG.error("{}: Exception IN CONSUMER POLL LOOP while reading from Kafka, time = " + System.currentTimeMillis(), this, e);
       consumerPollException.set(e);
       throw e;
     }
@@ -651,7 +664,8 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
     if (records == null) {
       // Check if the poll thread failed with an exception.
       if (consumerPollException.get() != null) {
-        throw new IOException("Exception while reading from Kafka", consumerPollException.get());
+        throw new IOException("Exception while reading from Kafka, current object: "
+            + this + "@" + Integer.toHexString(this.hashCode()), consumerPollException.get());
       }
       if (recordsDequeuePollTimeout.isLongerThan(RECORDS_DEQUEUE_POLL_TIMEOUT_MIN)) {
         recordsDequeuePollTimeout = recordsDequeuePollTimeout.minus(Duration.millis(1));
