@@ -593,6 +593,8 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
             records = ConsumerRecords.empty();
           }
 
+          LOG.info("Consumer poll records: {}", records);
+
           if (records != null) {
             for (ConsumerRecord<byte[], byte[]> r : records) {
               if (Arrays.equals(r.value(), EXCEPTION_MESSAGE_BYTES)) {
