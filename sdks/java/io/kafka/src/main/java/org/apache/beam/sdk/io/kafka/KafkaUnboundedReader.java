@@ -593,8 +593,6 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
             records = ConsumerRecords.empty();
           }
 
-          LOG.info("Consumer poll records: {}", records);
-
           if (records != null) {
             for (ConsumerRecord<byte[], byte[]> r : records) {
               if (Arrays.equals(r.value(), EXCEPTION_MESSAGE_BYTES)) {
@@ -613,7 +611,7 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
       }
       LOG.info("{}: Returning from consumer pool loop", this);
     } catch (Exception e) { // mostly an unrecoverable KafkaException.
-      LOG.error("{}: Exception IN CONSUMER POLL LOOP while reading from Kafka, time = " + System.currentTimeMillis(), this, e);
+      LOG.error(String.format("%s: Exception IN CONSUMER POLL LOOP while reading from Kafka, time = %s", this, System.currentTimeMillis()), e);
       consumerPollException.set(e);
       throw e;
     }
