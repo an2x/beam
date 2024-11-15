@@ -25,11 +25,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -569,6 +571,8 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
   private static final String EXCEPTION_MESSAGE = "FORCE_EXCEPTION";
   private static final byte[] EXCEPTION_MESSAGE_BYTES = EXCEPTION_MESSAGE.getBytes(StandardCharsets.UTF_8);
 
+  private static final Set<Long> EXCEPTION_MESSAGE_SEEN_OFFSETS = new HashSet<>();
+
   private void consumerPollLoop() {
     // Read in a loop and enqueue the batch of records, if any, to availableRecordsQueue.
     Consumer<byte[], byte[]> consumer = Preconditions.checkStateNotNull(this.consumer);
@@ -596,7 +600,12 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
           if (records != null) {
             for (ConsumerRecord<byte[], byte[]> r : records) {
               if (Arrays.equals(r.value(), EXCEPTION_MESSAGE_BYTES)) {
-                throw new RuntimeException("Received message: " + EXCEPTION_MESSAGE);
+                synchronized (EXCEPTION_MESSAGE_SEEN_OFFSETS) {
+                  if (EXCEPTION_MESSAGE_SEEN_OFFSETS.add(r.offset())) {
+                    throw new RuntimeException("Received message: " + EXCEPTION_MESSAGE + " (offset " + r.offset() + ")");
+                  }
+                }
+                LOG.info("Message {} already seen at offset {}, not throwing an exception.", EXCEPTION_MESSAGE, r.offset());
               }
             }
           }
