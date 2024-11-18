@@ -25,13 +25,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -571,7 +569,9 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
   private static final String EXCEPTION_MESSAGE = "FORCE_EXCEPTION";
   private static final byte[] EXCEPTION_MESSAGE_BYTES = EXCEPTION_MESSAGE.getBytes(StandardCharsets.UTF_8);
 
-  private static final Set<Long> EXCEPTION_MESSAGE_SEEN_OFFSETS = new HashSet<>();
+  private static final Object FORCED_EXCEPTION_LOCK = new Object();
+  private static final long FORCED_EXCEPTION_DELAY_MILLIS = 5 * 60 * 1000; // 5 minutes
+  private static long NEXT_EXCEPTION_MILLIS = 0;
 
   private void consumerPollLoop() {
     // Read in a loop and enqueue the batch of records, if any, to availableRecordsQueue.
@@ -585,6 +585,14 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
             // Each source has a single unique topic.
             List<TopicPartition> topicPartitions = source.getSpec().getTopicPartitions();
             Preconditions.checkStateNotNull(topicPartitions);
+
+            synchronized (FORCED_EXCEPTION_LOCK) {
+              if (NEXT_EXCEPTION_MILLIS > 0 && NEXT_EXCEPTION_MILLIS <= System.currentTimeMillis()) {
+                NEXT_EXCEPTION_MILLIS = 0;
+                LOG.warn("Forcing exception.");
+                throw new RuntimeException("FORCED EXCEPTION");
+              }
+            }
 
             stopwatch.start();
             records = consumer.poll(KAFKA_POLL_TIMEOUT.getMillis());
@@ -600,12 +608,14 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
           if (records != null) {
             for (ConsumerRecord<byte[], byte[]> r : records) {
               if (Arrays.equals(r.value(), EXCEPTION_MESSAGE_BYTES)) {
-                synchronized (EXCEPTION_MESSAGE_SEEN_OFFSETS) {
-                  if (EXCEPTION_MESSAGE_SEEN_OFFSETS.add(r.offset())) {
-                    throw new RuntimeException("Received message: " + EXCEPTION_MESSAGE + " (offset " + r.offset() + ")");
+                synchronized (FORCED_EXCEPTION_LOCK) {
+                  if (NEXT_EXCEPTION_MILLIS <= 0) {
+                    NEXT_EXCEPTION_MILLIS = System.currentTimeMillis() + FORCED_EXCEPTION_DELAY_MILLIS;
+                    LOG.warn("Received message: {} (offset {}), will throw an exception in {} ms.", EXCEPTION_MESSAGE, r.offset(), FORCED_EXCEPTION_DELAY_MILLIS);
+                  } else {
+                    LOG.warn("Received message: {} (offset {}), but an exception is already scheduled.", EXCEPTION_MESSAGE, r.offset());
                   }
                 }
-                LOG.info("Message {} already seen at offset {}, not throwing an exception.", EXCEPTION_MESSAGE, r.offset());
               }
             }
           }
@@ -620,7 +630,7 @@ class KafkaUnboundedReader<K, V> extends UnboundedReader<KafkaRecord<K, V>> {
       }
       LOG.info("{}: Returning from consumer pool loop", this);
     } catch (Exception e) { // mostly an unrecoverable KafkaException.
-      LOG.error(String.format("%s: Exception IN CONSUMER POLL LOOP while reading from Kafka, time = %s", this, System.currentTimeMillis()), e);
+      LOG.error(String.format("%s: Exception IN CONSUMER POLL LOOP while reading from Kafka", this), e);
       consumerPollException.set(e);
       throw e;
     }
